@@ -1,0 +1,31 @@
+[package]
+name = "ward"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "A pinentry that asks and never keeps"
+license = "BSD-3-Clause"
+repository = "https://github.com/lvim-tech/ward"
+
+[dependencies]
+fontdue = { version = "0.9", optional = true }
+# The only dependency of the protocol and terminal halves. Everything a pinentry
+# does at this layer is read a line, lock a page of memory and wipe it again —
+# and a crate for that would be a crate holding the passphrase.
+libc = "0.2"
+softbuffer = { version = "0.4", optional = true, default-features = false, features = ["wayland", "wayland-dlopen", "x11"] }
+winit = { version = "0.30", optional = true, default-features = false, features = ["wayland", "wayland-dlopen", "wayland-csd-adwaita", "x11", "rwh_06"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[features]
+# On by default: without a window ward cannot answer a prompt raised from a menu, a browser
+# or anything else with no terminal — which is the situation it was written for. Building
+# with --no-default-features leaves a tty-only pinentry whose whole dependency tree is libc.
+default = ["gui"]
+gui = ["dep:winit", "dep:softbuffer", "dep:fontdue"]
