@@ -46,9 +46,12 @@ fn rewrite(existing: &str, program: &Path) -> (String, Option<String>) {
             out.push(line.to_string());
             continue;
         }
-        if previous.is_none() {
-            previous = Some(rest.to_string());
-        }
+        // The LAST uncommented line, not the first: gpg-agent takes the last one it reads,
+        // so that is the pinentry that was actually in force and the only honest answer to
+        // "was:" and to "to go back:". Reporting the first sent a user with a duplicated
+        // line — a hand edit plus an old installer's append, which is how duplicates arise —
+        // back to a pinentry they had already replaced.
+        previous = Some(rest.to_string());
         if replaced {
             // gpg-agent takes the last one it reads, so a duplicate left behind would
             // silently win. Comment it out rather than delete it, and say why.
@@ -237,7 +240,9 @@ max-cache-ttl 900
         // override the one just written.
         let before = "pinentry-program /usr/bin/a\npinentry-program /usr/bin/b\n";
         let (after, prev) = rewrite(before, &ward());
-        assert_eq!(prev.as_deref(), Some("/usr/bin/a"));
+        // `b`, not `a`: last-wins is what the agent did, so it is what "was:" has to say.
+        // The way back this prints is the way back that restores what was running.
+        assert_eq!(prev.as_deref(), Some("/usr/bin/b"));
         assert!(after.contains("pinentry-program /usr/local/bin/ward"));
         assert!(after.contains("# pinentry-program /usr/bin/b"));
         assert_eq!(
