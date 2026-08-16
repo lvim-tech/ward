@@ -248,8 +248,11 @@ impl TtyFrontend {
         let mut out = Vec::with_capacity(1024);
         out.extend_from_slice(b"\x1b[2J\x1b[H");
 
+        // Everything below draws agent-supplied text, and every one of those calls goes
+        // through `sanitize` first. Doing it here rather than in `percent_decode` keeps the
+        // decoder faithful: the window can legitimately show what a terminal must not run.
         let line = |s: &str, out: &mut Vec<u8>| {
-            for chunk in wrap(s, w.saturating_sub(4)) {
+            for chunk in wrap(&sanitize(s), w.saturating_sub(4)) {
                 out.extend_from_slice(b"  ");
                 out.extend_from_slice(chunk.as_bytes());
                 out.extend_from_slice(b"\r\n");
@@ -268,7 +271,7 @@ impl TtyFrontend {
         // Error and note wrap like everything else. Left raw, a long SETERROR folded
         // wherever the terminal chose and lost the indent the rest of the prompt keeps.
         let coloured = |s: &str, colour: &[u8], out: &mut Vec<u8>| {
-            for chunk in wrap(s, w.saturating_sub(4)) {
+            for chunk in wrap(&sanitize(s), w.saturating_sub(4)) {
                 out.extend_from_slice(b"  ");
                 out.extend_from_slice(colour);
                 out.extend_from_slice(chunk.as_bytes());
@@ -289,7 +292,9 @@ impl TtyFrontend {
             st.prompt.as_deref().unwrap_or("Passphrase:")
         };
         out.extend_from_slice(b"  ");
-        out.extend_from_slice(prompt.as_bytes());
+        // The label is not wrapped, so it does not pass through `line`; sanitized here for
+        // the same reason everything else is.
+        out.extend_from_slice(sanitize(prompt).as_bytes());
         out.extend_from_slice(b" ");
 
         // One mark per CHARACTER, and the number beside it. That number is the whole point
@@ -327,6 +332,29 @@ fn window_width(fd: RawFd) -> usize {
         // A terminal that will not say how wide it is gets the width every terminal has.
         80
     }
+}
+
+/// Replaces control characters with a visible mark before anything reaches the terminal.
+///
+/// Everything drawn here — the title, the description, the error, the button labels — is
+/// text the AGENT sent, and `percent_decode` is faithful by design: `%1B` decodes to a real
+/// Escape. Written through, that is not text, it is instructions — mouse tracking switched
+/// on, the window title rewritten, OSC 52 writing the clipboard — and none of it is undone
+/// by restoring termios and leaving the alternate screen. The bytes are not hypothetical
+/// either: a description can carry a key's user ID, which is whatever was in the key.
+///
+/// U+FFFD rather than deletion, so the user can see that something was there. `\n` survives
+/// because `wrap` gives it meaning.
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() && c != '\n' {
+                '\u{FFFD}'
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// Breaks text at character boundaries so a wrapped Cyrillic line does not lose half a
@@ -383,9 +411,11 @@ impl Frontend for TtyFrontend {
                 return Ok(Outcome::Cancelled);
             }
             let Some(b) = self.read_byte()? else {
-                // The terminal went away mid-prompt.
+                // The terminal went away mid-prompt. Nobody declined — there was nobody left
+                // to ask, and the agent acts on that difference. Reported as cancellation,
+                // an ssh session dropping looked to the caller like a deliberate refusal.
                 self.leave_raw();
-                return Ok(Outcome::Cancelled);
+                return Ok(Outcome::Unavailable);
             };
 
             match b {
@@ -494,7 +524,7 @@ impl Frontend for TtyFrontend {
             let mut out = Vec::with_capacity(512);
             out.extend_from_slice(b"\x1b[2J\x1b[H\r\n");
             if let Some(d) = st.desc.as_deref() {
-                for l in wrap(d, self.cols.clamp(20, 100).saturating_sub(4)) {
+                for l in wrap(&sanitize(d), self.cols.clamp(20, 100).saturating_sub(4)) {
                     out.extend_from_slice(format!("  {l}\r\n").as_bytes());
                 }
             }
@@ -512,8 +542,9 @@ impl Frontend for TtyFrontend {
                 return Ok(Outcome::Cancelled);
             }
             let Some(b) = self.read_byte()? else {
+                // As in getpin: the terminal going away is not a decision.
                 self.leave_raw();
-                return Ok(Outcome::Cancelled);
+                return Ok(Outcome::Unavailable);
             };
             // Escape needs the same care here as in getpin: an arrow key starts with the
             // same byte, and dismissing "Really delete this key?" because somebody nudged
@@ -524,11 +555,22 @@ impl Frontend for TtyFrontend {
                 }
                 continue;
             }
+            // Escape and Ctrl-C mean the same thing in every ward prompt, one button or
+            // three: nobody answered. The terminal used to take Escape as a DISMISSAL for a
+            // one-button CONFIRM while the window reported cancellation for the very same
+            // key — one gesture, `OK` from one front-end and `ERR 83886179` from the other,
+            // decided by which happened to be reachable.
+            if b == 0x1b || b == 0x03 {
+                self.leave_raw();
+                return Ok(Outcome::Cancelled);
+            }
             if one_button {
-                // Only a deliberate keystroke dismisses. Accepting ANY byte meant the first
-                // byte of an arrow key closed the message before it had been read.
+                // Only a deliberate keystroke dismisses, and only the one the hint names —
+                // the window accepts Enter and nothing else, so the terminal does too.
+                // Accepting ANY byte meant the first byte of an arrow key closed the message
+                // before it had been read.
                 match b {
-                    b'\r' | b'\n' | b' ' | 0x1b => {
+                    b'\r' | b'\n' => {
                         self.leave_raw();
                         return Ok(Outcome::Ok);
                     }
@@ -544,10 +586,6 @@ impl Frontend for TtyFrontend {
                     self.leave_raw();
                     return Ok(Outcome::NotOk);
                 }
-                0x1b | 0x03 => {
-                    self.leave_raw();
-                    return Ok(Outcome::Cancelled);
-                }
                 _ => {}
             }
         }
@@ -560,7 +598,29 @@ impl Frontend for TtyFrontend {
 
 #[cfg(test)]
 mod tests {
-    use super::wrap;
+    use super::{sanitize, wrap};
+
+    #[test]
+    fn escape_sequences_from_the_agent_are_never_drawn_as_escapes() {
+        // `SETDESC %1B[?1000h` decodes to a real Escape. Written through, it switches mouse
+        // tracking on in somebody's terminal and survives every restore this module does.
+        let out = sanitize("\x1b[?1000h");
+        assert!(
+            !out.contains('\x1b'),
+            "an escape reached the terminal: {out:?}"
+        );
+        assert_eq!(out, "\u{FFFD}[?1000h");
+        // The bell and the OSC terminator are control characters too.
+        assert_eq!(sanitize("\x1b]0;title\x07"), "\u{FFFD}]0;title\u{FFFD}");
+    }
+
+    #[test]
+    fn sanitize_keeps_the_text_and_the_line_breaks() {
+        // Everything a description legitimately carries survives, including the alphabet
+        // this program exists for and the newlines `wrap` gives meaning to.
+        assert_eq!(sanitize("парола за ключа"), "парола за ключа");
+        assert_eq!(sanitize("one\ntwo"), "one\ntwo");
+    }
 
     #[test]
     fn wraps_without_splitting_characters() {
