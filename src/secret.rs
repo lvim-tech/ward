@@ -18,6 +18,7 @@ pub struct Secret {
     cap: usize,
     len: usize,
     locked: bool,
+    nodump: bool,
 }
 
 impl Secret {
@@ -51,15 +52,20 @@ impl Secret {
         // SAFETY: the mapping was just created with this exact length.
         let locked = unsafe { libc::mlock(p as *mut libc::c_void, cap) } == 0;
 
-        // Excluded from any core dump that still happens despite RLIMIT_CORE.
+        // Excluded from any core dump that still happens despite RLIMIT_CORE. The result is
+        // kept rather than dropped: a hardening step that silently fails is worse than one
+        // that was never attempted, which is the rule `harden` was built on, and this was
+        // the last defensive call in the program still ignoring its own answer.
         // SAFETY: same mapping and length.
-        unsafe { libc::madvise(p as *mut libc::c_void, cap, libc::MADV_DONTDUMP) };
+        let nodump =
+            unsafe { libc::madvise(p as *mut libc::c_void, cap, libc::MADV_DONTDUMP) } == 0;
 
         Ok(Secret {
             ptr: p,
             cap,
             len: 0,
             locked,
+            nodump,
         })
     }
 
@@ -67,6 +73,13 @@ impl Secret {
     /// memlock limit refused, and swap can reach the passphrase after all.
     pub fn is_locked(&self) -> bool {
         self.locked
+    }
+
+    /// Whether the kernel agreed to keep this mapping out of core dumps. False means only
+    /// `RLIMIT_CORE = 0` and `PR_SET_DUMPABLE = 0` stand between the passphrase and a dump
+    /// file — still two locks, but one fewer than the program claims.
+    pub fn excluded_from_dumps(&self) -> bool {
+        self.nodump
     }
 
     /// Appends bytes, silently ignoring anything past the capacity.
@@ -152,12 +165,16 @@ impl Secret {
     pub fn eq_constant_time(&self, other: &Secret) -> bool {
         let a = self.as_bytes();
         let b = other.as_bytes();
-        let mut diff = (a.len() ^ b.len()) as u8;
+        // The lengths are folded in as a plain "same or not". XOR-ing them and truncating to
+        // a byte was the earlier form: correct only because of the length check that used to
+        // follow it, since lengths differing by a multiple of 256 XOR to zero in the low
+        // byte. A comparison this small should not need a second condition to be right.
+        let mut diff = u8::from(a.len() != b.len());
         let n = a.len().min(b.len());
         for i in 0..n {
             diff |= a[i] ^ b[i];
         }
-        diff == 0 && a.len() == b.len()
+        diff == 0
     }
 
     /// Wipes the contents without releasing the buffer. Used between retry attempts: the
@@ -241,6 +258,33 @@ mod tests {
         s.push(b"abcdefgh");
         assert_eq!(s.len(), 4);
         assert_eq!(s.as_bytes(), b"abcd");
+    }
+
+    #[test]
+    fn a_passphrase_agrees_only_with_itself() {
+        let mk = |s: &str| {
+            let mut b = Secret::with_capacity(64).unwrap();
+            b.push(s.as_bytes());
+            b
+        };
+        assert!(mk("тайна").eq_constant_time(&mk("тайна")));
+        assert!(!mk("тайна").eq_constant_time(&mk("тайнa"))); // last letter Latin
+                                                              // A prefix is not a match, in either direction, and neither is nothing at all.
+        assert!(!mk("тайна").eq_constant_time(&mk("тай")));
+        assert!(!mk("тай").eq_constant_time(&mk("тайна")));
+        assert!(!mk("").eq_constant_time(&mk("x")));
+        assert!(mk("").eq_constant_time(&mk("")));
+    }
+
+    #[test]
+    fn lengths_differing_by_a_multiple_of_256_still_disagree() {
+        // The earlier form XOR-ed the lengths and truncated to a byte, so 1 and 257 folded
+        // to zero and the answer rested entirely on a second condition beside it.
+        let mut a = Secret::with_capacity(512).unwrap();
+        a.push(&[b'a'; 1]);
+        let mut b = Secret::with_capacity(512).unwrap();
+        b.push(&[b'a'; 257]);
+        assert!(!a.eq_constant_time(&b));
     }
 
     #[test]
