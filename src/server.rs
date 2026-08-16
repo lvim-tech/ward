@@ -134,6 +134,11 @@ pub fn serve(
     // OPTION lines were previously ignored while the help text said otherwise.
     let mut st = initial;
 
+    // Built once and kept for the whole conversation. The window in particular cannot be
+    // built twice — see `ui::Frontends` — and the agent asks more than once on the same
+    // connection whenever the first passphrase was wrong.
+    let mut fronts = ui::Frontends::default();
+
     while let Some(line) = reader.line()? {
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -226,8 +231,10 @@ pub fn serve(
             "MESSAGE" | "CONFIRM" | "GETPIN" => {
                 // Choosing the front-end here, per request, rather than once at startup:
                 // the options that decide it — the client's display, its tty — arrive after
-                // the greeting and can differ between one prompt and the next.
-                let mut front = match ui::select(&st) {
+                // the greeting and can differ between one prompt and the next. Choosing is
+                // not the same as building: `Frontends` keeps the window across prompts
+                // because winit only permits one event loop per process.
+                let front = match fronts.select(&st) {
                     Ok(f) => f,
                     Err(ui::NoFrontend(why)) => {
                         // Loud, not silent, and distinct from cancellation. "the user
@@ -262,6 +269,13 @@ pub fn serve(
                             // passphrase can reach swap, and a program that claims locked
                             // memory it did not get is worse than one that never claimed it.
                             eprintln!("ward: the passphrase buffer is NOT locked in RAM");
+                        }
+                        if !secret.excluded_from_dumps() {
+                            // The same honesty, one lock down: RLIMIT_CORE and
+                            // PR_SET_DUMPABLE still stand, but the mapping is not marked.
+                            eprintln!(
+                                "ward: the passphrase buffer is NOT excluded from core dumps"
+                            );
                         }
                         // A front-end that fails mid-prompt (its own locked buffer refused,
                         // the terminal went away) is answered too. Propagating out of
@@ -301,7 +315,20 @@ pub fn serve(
                     }
                     "CONFIRM" => {
                         let one_button = rest.split_whitespace().any(|w| w == "--one-button");
-                        match front.confirm(&st, one_button)? {
+                        // Answered rather than died on, for the same reason GETPIN is: a
+                        // terminal that goes away mid-confirm used to propagate out of
+                        // `serve` and reach the agent as a closed pipe on a command it was
+                        // still waiting for.
+                        let got = match front.confirm(&st, one_button) {
+                            Ok(o) => o,
+                            Err(e) => {
+                                eprintln!("ward: the prompt failed: {e}");
+                                writer.err(ERR_NO_PIN_ENTRY, "the prompt could not be shown")?;
+                                st.error = None;
+                                continue;
+                            }
+                        };
+                        match got {
                             Outcome::Ok => writer.ok("")?,
                             Outcome::NotOk => writer.err(ERR_NOT_CONFIRMED, "not confirmed")?,
                             Outcome::Unavailable => {
@@ -313,7 +340,12 @@ pub fn serve(
                         }
                     }
                     _ => {
-                        front.message(&st)?;
+                        if let Err(e) = front.message(&st) {
+                            eprintln!("ward: the message could not be shown: {e}");
+                            writer.err(ERR_NO_PIN_ENTRY, "the prompt could not be shown")?;
+                            st.error = None;
+                            continue;
+                        }
                         writer.ok("")?;
                     }
                 }

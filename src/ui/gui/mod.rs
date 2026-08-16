@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{ElementState, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::platform::pump_events::EventLoopExtPumpEvents;
@@ -60,6 +60,12 @@ impl GuiFrontend {
     /// so a `WAYLAND_DISPLAY` naming a socket that no longer exists fails here rather than
     /// being believed. Trusting the variable instead is precisely how the previous pinentry
     /// failed silently.
+    ///
+    /// Callable ONCE per process, and not by choice: winit sets a global flag on the first
+    /// attempt — successful or not — and answers `RecreationAttempt` to every later one.
+    /// `ui::Frontends` is what keeps this honest by holding the result for the whole
+    /// connection; calling it per prompt is what made the retry after a wrong passphrase
+    /// fall through to the terminal.
     pub fn new() -> Result<Self, String> {
         let events = EventLoop::new().map_err(|e| format!("no display could be opened: {e}"))?;
         let text = font::Text::new()?;
@@ -388,9 +394,17 @@ impl App<'_> {
     }
 }
 
-impl ApplicationHandler for App<'_> {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
+impl App<'_> {
+    /// Puts the window up if it is not up already.
+    ///
+    /// Called from `new_events`, which fires on every pump, and not only from `resumed`.
+    /// winit emits `Resumed` exactly once per EVENT LOOP, on `StartCause::Init`, and the
+    /// loop now outlives the prompt — it has to, because winit permits only one per process.
+    /// Creating the window from `resumed` alone therefore left the second `GETPIN` of a
+    /// connection — the retry after a wrong passphrase — spinning forever on a window
+    /// nobody was ever going to be asked to create.
+    fn ensure_window(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() || self.outcome.is_some() {
             return;
         }
         let (w, h) = self.size();
@@ -433,6 +447,16 @@ impl ApplicationHandler for App<'_> {
             }
         }
     }
+}
+
+impl ApplicationHandler for App<'_> {
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, _cause: StartCause) {
+        self.ensure_window(event_loop);
+    }
+
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        self.ensure_window(event_loop);
+    }
 
     fn window_event(
         &mut self,
@@ -473,8 +497,11 @@ impl ApplicationHandler for App<'_> {
                                     self.clear_entry();
                                 }
                             } else if matches!(self.ask, Ask::Pin) {
-                                let owned = s.to_string();
-                                self.push(&owned);
+                                // Straight from winit's inline string into locked memory.
+                                // The `to_string()` that used to stand here made a heap copy
+                                // of every keystroke that nothing ever wiped, and it was not
+                                // even working around a borrow: `s` borrows the event.
+                                self.push(s);
                             } else if matches!(self.ask, Ask::Confirm { one_button: false }) {
                                 // The same letters the terminal takes, so a CONFIRM answers
                                 // identically whichever front-end the user got.

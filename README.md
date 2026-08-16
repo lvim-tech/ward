@@ -55,7 +55,10 @@ appears only when there is something to ask: a key with no passphrase never summ
 
 **The protocol.** gpg-agent talks to a pinentry over Assuan on stdin/stdout —
 `SETDESC`, `SETPROMPT`, `GETPIN`, `CONFIRM`, `BYE`. ward answers exactly that and stores
-nothing between calls; each invocation is a fresh process the agent starts and ends.
+nothing between calls. The agent starts a process per operation and ends it, and within
+one it may ask more than once — a wrong passphrase comes back as `SETERROR` and another
+`GETPIN` on the same connection. Nothing of the previous attempt survives into the next:
+the buffer is wiped between them.
 
 **Front-end selection — the decision that is easy to get wrong.** "If `OPTION ttyname`
 was given, draw on that tty" is wrong: a graphical application launched from a shell
