@@ -312,6 +312,70 @@ mod tests {
         }
     }
 
+    /// Runs `data_secret` into a pipe and returns what it wrote.
+    ///
+    /// Through a real descriptor rather than a mock, because the whole point of that
+    /// function is that it never builds a `String` on the way out: anything that could be
+    /// captured in memory would be a different code path from the one being tested.
+    fn data_secret_output(s: &Secret) -> String {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: a two-element array, which is what pipe(2) writes into.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe failed");
+        let (r, w) = (fds[0], fds[1]);
+
+        let mut writer = Writer { fd: w };
+        writer.data_secret(s).expect("data_secret failed");
+        // SAFETY: the write end is ours and is not used again.
+        unsafe { libc::close(w) };
+
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            // SAFETY: reading into a valid stack buffer from a descriptor we own.
+            let n = unsafe { libc::read(r, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            assert!(n >= 0, "read failed");
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n as usize]);
+        }
+        // SAFETY: the read end is ours and is not used again.
+        unsafe { libc::close(r) };
+        String::from_utf8(out).expect("the reply was not UTF-8")
+    }
+
+    #[test]
+    fn the_longest_passphrase_survives_being_split_across_d_lines() {
+        // 2048 characters, which is what a pinentry guarantees its callers, in the shape
+        // that costs the most: every other character escapes to three bytes and the rest are
+        // two-byte Cyrillic. A single `D` line would pass every test written with a short
+        // passphrase and fail the person who took the advice to use a long one.
+        let original: String = "%п".repeat(1024);
+        assert_eq!(original.chars().count(), 2048);
+
+        let mut s = Secret::with_capacity(2048 * 4).unwrap();
+        s.push(original.as_bytes());
+
+        let reply = data_secret_output(&s);
+        let lines: Vec<&str> = reply.trim_end_matches('\n').split('\n').collect();
+        assert!(lines.len() > 1, "the passphrase was not split at all");
+
+        let mut payload = String::new();
+        for l in &lines {
+            assert!(l.starts_with("D "), "not a data line: {l:?}");
+            // Including the newline the line is terminated with, against the protocol's
+            // limit rather than against the payload constant.
+            assert!(
+                l.len() + 1 < MAX_LINE,
+                "a line is {} bytes, over the protocol limit",
+                l.len() + 1
+            );
+            payload.push_str(&l[2..]);
+        }
+        // The client concatenates consecutive `D` payloads, so this is what it reassembles.
+        assert_eq!(percent_decode(&payload), original);
+    }
+
     #[test]
     fn escapes_only_what_must_be_escaped() {
         let mut out = [0u8; 3];

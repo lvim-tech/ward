@@ -126,6 +126,152 @@ fn converse(args: &[&str], script: &str, keys: &[&[u8]]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// Runs a script, then returns everything ward drew ON THE TERMINAL — not its protocol
+/// replies. Used to assert about the bytes that reach somebody's session.
+///
+/// The master is put in non-blocking mode and drained while the child is still at the
+/// prompt: once the slave is closed a read on the master answers EIO, so waiting for the
+/// child to exit would mean reading nothing at all.
+fn drawn_on_the_terminal(script: &str, keys: &[&[u8]]) -> Vec<u8> {
+    let mut pty = open_pty();
+    // SAFETY: the master is ours; adding O_NONBLOCK to its flags.
+    unsafe {
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&pty.master);
+        let fl = libc::fcntl(fd, libc::F_GETFL);
+        assert!(fl >= 0, "F_GETFL failed");
+        assert_eq!(libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK), 0);
+    }
+    let mut child = Command::new(ward_bin())
+        .args(["--frontend", "tty"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("DISPLAY")
+        .spawn()
+        .expect("ward did not start");
+
+    let mut sin = child.stdin.take().unwrap();
+    sin.write_all(script.replace("{tty}", &pty.slave_path).as_bytes())
+        .unwrap();
+    sin.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+
+    let mut seen = Vec::new();
+    let mut buf = [0u8; 8192];
+    while let Ok(n) = pty.master.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        seen.extend_from_slice(&buf[..n]);
+    }
+
+    for k in keys {
+        pty.master.write_all(k).unwrap();
+        pty.master.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+    }
+    drop(sin);
+    let _ = child.wait();
+    seen
+}
+
+#[test]
+fn an_escape_sequence_in_a_description_is_not_executed_by_the_terminal() {
+    // `SETDESC` text comes from the agent, and a key's user ID is whatever was in the key.
+    // `%1B` decodes to a real Escape; drawn through, it switches mouse tracking on in the
+    // user's session and survives every restore ward performs — the same class of damage
+    // this project already lived through once.
+    let seen = drawn_on_the_terminal(
+        "OPTION ttyname={tty}\nSETDESC %1B[?1000h and %1B]0;stolen%07\nGETPIN\n",
+        &[b"\x1b"],
+    );
+    assert!(!seen.is_empty(), "ward drew nothing on the terminal");
+    assert!(
+        !seen.windows(8).any(|w| w == b"\x1b[?1000h"),
+        "mouse tracking was switched on by a description"
+    );
+    assert!(
+        !seen.windows(4).any(|w| w == b"\x1b]0;"),
+        "a description rewrote the terminal title"
+    );
+    // The text itself still appears — the escape is shown, not obeyed and not swallowed.
+    assert!(
+        seen.windows(7).any(|w| w == b"[?1000h"),
+        "the description was dropped instead of being shown safely"
+    );
+}
+
+#[test]
+fn a_one_button_confirmation_answers_the_same_key_the_same_way_as_the_window() {
+    // Escape is cancellation in every ward prompt. The terminal used to dismiss a
+    // one-button CONFIRM with `OK` for that key while the window answered ERR CANCELED —
+    // one gesture, two protocol answers, decided by which front-end was reachable.
+    let cancelled = converse(
+        &[],
+        "OPTION ttyname={tty}\nSETDESC note\nCONFIRM --one-button\nBYE\n",
+        &[b"\x1b"],
+    );
+    assert!(
+        cancelled.contains("ERR 83886179"),
+        "escape did not cancel a one-button confirmation: {cancelled:?}"
+    );
+
+    // And the key the hint actually names still dismisses it.
+    let dismissed = converse(
+        &[],
+        "OPTION ttyname={tty}\nSETDESC note\nCONFIRM --one-button\nBYE\n",
+        &[b"\r"],
+    );
+    assert!(
+        !dismissed.contains("ERR"),
+        "enter did not dismiss a one-button confirmation: {dismissed:?}"
+    );
+}
+
+#[test]
+fn a_second_getpin_on_the_same_connection_is_answered_too() {
+    // The retry flow: on a wrong passphrase the agent sends SETERROR and GETPIN again, on
+    // the SAME pinentry process. Front-ends used to be built per prompt, which the window
+    // cannot survive — winit permits one event loop per process — so the second prompt fell
+    // through to whatever terminal was named, or to nothing. This is the half of that the
+    // terminal can prove; the window's half is argued in `ui::Frontends` and is not
+    // reachable from a test that must not open a window on the developer's desktop.
+    let replies = converse(
+        &[],
+        "OPTION ttyname={tty}\nSETDESC first\nGETPIN\nSETERROR Bad Passphrase\nGETPIN\nBYE\n",
+        &["едно".as_bytes(), b"\r", "две".as_bytes(), b"\r"],
+    );
+    assert!(
+        replies.contains("D едно") && replies.contains("D две"),
+        "the second prompt was not answered: {replies:?}"
+    );
+}
+
+#[test]
+fn a_line_longer_than_the_protocol_allows_ends_the_conversation() {
+    // stdin is reachable by anything that can start ward. An unbounded `read_line` would
+    // grow for as long as a peer keeps sending without a newline; the bound is enforced, and
+    // this is the test that says so.
+    let mut child = Command::new(ward_bin())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("DISPLAY")
+        .spawn()
+        .unwrap();
+    let mut sin = child.stdin.take().unwrap();
+    let _ = sin.write_all(format!("SETDESC {}\nBYE\n", "a".repeat(1200)).as_bytes());
+    drop(sin);
+    let out = child.wait_with_output().expect("ward did not finish");
+    assert!(
+        !out.status.success(),
+        "an over-long line was accepted: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 #[test]
 fn an_arrow_key_is_not_a_refusal_in_confirm_either() {
     // The same guard `an_arrow_key_is_not_a_refusal` puts on GETPIN. CONFIRM used to take
