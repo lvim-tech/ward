@@ -108,7 +108,12 @@ impl State {
 /// Splits `COMMAND rest` into its two halves.
 fn split_command(line: &str) -> (&str, &str) {
     match line.find(char::is_whitespace) {
-        Some(i) => (&line[..i], line[i + 1..].trim_start()),
+        // The remainder starts AT the separator, not one byte past it, and `trim_start`
+        // removes the separator itself. `char::is_whitespace` matches U+00A0 and U+2003 as
+        // well as the space, and those are two and three bytes: `i + 1` landed inside the
+        // character and panicked — with `panic = "abort"` that is the process gone, no `ERR`
+        // and no `BYE`, on a line anything able to write to our stdin could send.
+        Some(i) => (&line[..i], line[i..].trim_start()),
         None => (line, ""),
     }
 }
@@ -433,6 +438,17 @@ mod tests {
             split_command("OPTION  ttyname=/dev/pts/3"),
             ("OPTION", "ttyname=/dev/pts/3")
         );
+    }
+
+    #[test]
+    fn a_multibyte_space_does_not_split_a_character_in_half() {
+        // `char::is_whitespace` matches more than the space, and the ones it matches are not
+        // all one byte. Slicing one byte past the separator landed inside U+00A0 and
+        // panicked — which under `panic = "abort"` is the process gone with no reply at all,
+        // reachable by anything that can write to ward's stdin.
+        assert_eq!(split_command("GETPIN\u{00A0}x"), ("GETPIN", "x"));
+        assert_eq!(split_command("SETDESC\u{2003}text"), ("SETDESC", "text"));
+        assert_eq!(split_command("GETPIN\u{00A0}"), ("GETPIN", ""));
     }
 
     #[test]
